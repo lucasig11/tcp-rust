@@ -1,6 +1,6 @@
 #![allow(unused_variables)]
 #![allow(dead_code)]
-use std::{error::Error, io, net::Ipv4Addr};
+use std::{error::Error, io, net::Ipv4Addr, u32};
 
 use etherparse::{Ipv4HeaderSlice, TcpHeaderSlice};
 
@@ -126,6 +126,7 @@ impl Connection {
         };
 
         // Construct a new TCP header to send the acknowledgment
+        // The kernel sets the checksum for us
         let mut syn_ack = etherparse::TcpHeader::new(
             tcph.destination_port(),
             tcph.source_port(),
@@ -162,17 +163,8 @@ impl Connection {
         // Acceptable ACK check
         // SND.UNA < SEG.ACK <= SND.NEXT
         let ackn = tcph.acknowledgment_number();
-        if self.send.una < ackn {
-            // Check is violated iff n is between u and a
-            if self.send.nxt >= self.send.una && self.send.nxt < ackn {
-                return Ok(());
-            }
-        } else {
-            // Check is ok iff n is between u and a
-            if self.send.nxt >= ackn && self.send.nxt < self.send.una {
-            } else {
-                return Ok(());
-            }
+        if !ackn.is_between_wrapped(self.send.una, self.send.nxt.wrapping_add(1)) {
+            return Ok(());
         }
 
         match self.state {
@@ -184,5 +176,60 @@ impl Connection {
             }
         }
         Ok(())
+    }
+}
+
+trait Wrap {
+    fn is_between_wrapped(&self, start: u32, end: u32) -> bool;
+}
+
+impl Wrap for u32 {
+    fn is_between_wrapped(&self, start: u32, end: u32) -> bool {
+        use std::cmp::Ordering;
+
+        match start.cmp(&self) {
+            Ordering::Equal => false,
+
+            // Check is violated iff end is between start and x
+            //  0 |------------S---------X--------E----| OK
+            //  0 |------E-----S---------X-------------| OK
+            //
+            //  0 |----S------------E----X-------------| Not OK
+            Ordering::Less => !(end >= start && end <= *self),
+
+            // Check is ok iff end is between start and x (S < E < X)
+            // Only this case (S > X)
+            //  0 |------X-----E---------S------------| OK
+            Ordering::Greater => end < start && end > *self,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deals_with_wrapping_less() {
+        // Tests this case (X > S)
+        //  0 |------E-----S---------X-------------| OK
+        //           10    30        50
+        let start = 30u32;
+        let x = 50u32;
+        let end = 10u32;
+
+        assert!(x.is_between_wrapped(start, end.wrapping_add(1)));
+    }
+
+    #[test]
+    fn deals_with_wrapping_greater() {
+        // Tests this case (X < S)
+        //  0 |------X-----E---------S------------| OK
+        //           10    20        50
+        let start = 50u32;
+        let x = 10u32;
+        let end = 20u32;
+
+        assert!(x.is_between_wrapped(start, end.wrapping_add(1)));
     }
 }
