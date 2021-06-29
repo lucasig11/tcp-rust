@@ -6,8 +6,8 @@ use etherparse::{Ipv4HeaderSlice, TcpHeaderSlice};
 
 /// TCP connection states
 pub enum State {
-    Closed,
-    Listen,
+    // Closed,
+    // Listen,
     SynRecvd,
     Estab,
 }
@@ -15,6 +15,7 @@ pub enum State {
 // TCB - transmition control block
 pub struct Connection {
     state: State,
+    ip: etherparse::Ipv4Header,
     send: SendSequenceSpace,
     recv: ReceiveSequenceSpace,
 }
@@ -96,7 +97,7 @@ impl Connection {
         }
 
         let iss = 0;
-        let c = Self {
+        let mut c = Self {
             state: State::SynRecvd,
             recv: ReceiveSequenceSpace {
                 // Keep track of sender info
@@ -115,6 +116,13 @@ impl Connection {
                 wl1: 0,
                 wl2: 0,
             },
+            ip: etherparse::Ipv4Header::new(
+                0,
+                64,
+                etherparse::IpTrafficClass::Tcp,
+                iph.destination_addr().octets(),
+                iph.source_addr().octets(),
+            ),
         };
 
         // Construct a new TCP header to send the acknowledgment
@@ -128,20 +136,12 @@ impl Connection {
         syn_ack.acknowledgment_number = c.recv.nxt;
         syn_ack.syn = true;
         syn_ack.ack = true;
-
-        // Build an IP packet from the header
-        let ip_packet = etherparse::Ipv4Header::new(
-            syn_ack.header_len(),
-            64,
-            etherparse::IpTrafficClass::Tcp,
-            iph.destination_addr().octets(),
-            iph.source_addr().octets(),
-        );
+        c.ip.set_payload_len(syn_ack.header_len() as usize + 0)?;
 
         // Write headers to buffer
         let unwritten = {
             let mut unwritten = &mut buf[..];
-            ip_packet.write(&mut unwritten)?;
+            c.ip.write(&mut unwritten)?;
             syn_ack.write(&mut unwritten)?;
             unwritten.len()
         };
@@ -159,7 +159,30 @@ impl Connection {
         tcph: TcpHeaderSlice<'a>,
         _data: &'a [u8],
     ) -> io::Result<()> {
-        // unimplemented!();
+        // Acceptable ACK check
+        // SND.UNA < SEG.ACK <= SND.NEXT
+        let ackn = tcph.acknowledgment_number();
+        if self.send.una < ackn {
+            // Check is violated iff n is between u and a
+            if self.send.nxt >= self.send.una && self.send.nxt < ackn {
+                return Ok(());
+            }
+        } else {
+            // Check is ok iff n is between u and a
+            if self.send.nxt >= ackn && self.send.nxt < self.send.una {
+            } else {
+                return Ok(());
+            }
+        }
+
+        match self.state {
+            State::SynRecvd => {
+                // Expect to get an ACK for our SYN
+            }
+            State::Estab => {
+                todo!()
+            }
+        }
         Ok(())
     }
 }
