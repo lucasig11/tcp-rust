@@ -1,23 +1,25 @@
 #![allow(unused_variables)]
 #![allow(dead_code)]
-use std::{error::Error, io, net::Ipv4Addr, u32};
+use std::{convert::TryInto, error::Error, io, net::Ipv4Addr, u32};
 
 use etherparse::{Ipv4HeaderSlice, TcpHeaderSlice};
 
 /// TCP connection states
 pub enum State {
-    // Closed,
-    // Listen,
+    /// SYN Received
     SynRecvd,
+    /// Connection established
     Estab,
 }
 
 // TCB - transmition control block
 pub struct Connection {
-    state: State,
-    ip: etherparse::Ipv4Header,
-    send: SendSequenceSpace,
-    recv: ReceiveSequenceSpace,
+    /// Connection's current state. See [`State`].
+    pub state: State,
+    /// Connection IP Header
+    pub ip: etherparse::Ipv4Header,
+    pub send: SendSequenceSpace,
+    pub recv: ReceiveSequenceSpace,
 }
 
 /// Send Sequence Space (RFC 793 S3.2 F4)
@@ -32,24 +34,24 @@ pub struct Connection {
 /// 3 - sequence numbers allowed for new data transmission
 /// 4 - future sequence numbers which are not yet allowed
 /// ```
-struct SendSequenceSpace {
+pub struct SendSequenceSpace {
     /// Send Unacknowledged
-    una: u32,
+    pub una: u32,
     /// Send Next
-    nxt: u32,
+    pub nxt: u32,
     /// Send window
-    wnd: u16,
+    pub wnd: u16,
     /// Send urgent pointer
-    up: bool,
+    pub up: bool,
     /// Segment sequence number for last window update
-    wl1: u32,
+    pub wl1: u32,
     /// Segment acknowledgement numebr use for alast window update
-    wl2: u32,
+    pub wl2: u32,
     /// Initial sequence number
-    iss: u32,
+    pub iss: u32,
 }
 
-/// Receive Sequence Space
+/// Receive Sequence Space (RFC 793 S3.2 F5)
 /// ```md
 ///     1          2          3
 /// ----------|----------|----------
@@ -60,15 +62,15 @@ struct SendSequenceSpace {
 /// 2 - sequence numbers allowed for new reception
 /// 3 - future sequence numbers which are not yet allowed
 /// ```
-struct ReceiveSequenceSpace {
+pub struct ReceiveSequenceSpace {
     /// Receive Next
-    nxt: u32,
+    pub nxt: u32,
     /// Receive window
-    wnd: u16,
+    pub wnd: u16,
     /// Receive urgent pointer
-    up: bool,
+    pub up: bool,
     /// Initial receive sequence number
-    irs: u32,
+    pub irs: u32,
 }
 
 /// Connection quad
@@ -81,8 +83,10 @@ pub struct Quad {
 }
 
 impl Connection {
+    /// Accepts a new incoming connection, setting the initial handshake,
+    /// receiving the SYN and returning an ACK and a SYN.
     /// The 'a here is the lifetime of the packet itself,
-    /// which is the lifetime of the buffer at TCP::run
+    /// which is the lifetime of the buffer at [`crate::TcpSocket::run`].
     pub fn accept<'a>(
         nic: &mut tun_tap::Iface,
         iph: Ipv4HeaderSlice<'a>,
@@ -153,17 +157,35 @@ impl Connection {
         Ok(Some(c))
     }
 
+    /// Gets called when the connection is already known.
+    /// Expecting an ACK for the SYN we sent on [`Connection::accept()`].
     pub fn on_packet<'a>(
         &mut self,
         nic: &mut tun_tap::Iface,
         iph: Ipv4HeaderSlice<'a>,
         tcph: TcpHeaderSlice<'a>,
-        _data: &'a [u8],
+        data: &'a [u8],
     ) -> io::Result<()> {
         // Acceptable ACK check
         // SND.UNA < SEG.ACK <= SND.NEXT
         let ackn = tcph.acknowledgment_number();
         if !ackn.is_between_wrapped(self.send.una, self.send.nxt.wrapping_add(1)) {
+            return Ok(());
+        }
+
+        // Valid segment check
+        // RCV.NXT =< SEG.SEQ < RCV.NXT + RCV.WND // First bit
+        // RCV.NXT =< SEG.SEQ + SEG.LEN - 1 < RCV.NXT + RCV.WND // Last bit
+        let seqn = tcph.sequence_number();
+        let len: u32 = data.len().try_into().unwrap();
+
+        if !seqn.is_between_wrapped(
+            self.recv.nxt.wrapping_sub(1),
+            self.recv.nxt.wrapping_add(self.recv.wnd as u32),
+        ) && !(seqn + len - 1).is_between_wrapped(
+            self.recv.nxt.wrapping_sub(1),
+            self.recv.nxt.wrapping_add(self.recv.wnd as u32),
+        ) {
             return Ok(());
         }
 
@@ -179,11 +201,38 @@ impl Connection {
     }
 }
 
-trait Wrap {
+/// Trait to deal with comparison of wrapping numbers.
+pub trait Wrap {
     fn is_between_wrapped(&self, start: u32, end: u32) -> bool;
 }
 
 impl Wrap for u32 {
+    /// Compare numbers taking into consideration that they can be
+    /// wrapped.
+    /// # Examples
+    /// ```
+    /// # use tcp_rust::connection::Wrap;
+    /// // Tests this case (X > S)
+    /// //  0 |------E-----S---------X-------------| OK
+    /// //           10    30        50
+    /// let start = 30u32;
+    /// let x = 50u32;
+    /// let end = 10u32;
+    ///
+    /// assert!(x.is_between_wrapped(start, end.wrapping_add(1)));
+    /// ```
+    ///
+    /// ```
+    /// # use tcp_rust::connection::Wrap;
+    /// // Tests this case (X < S)
+    /// //  0 |------X-----E---------S------------| OK
+    /// //           10    20        50
+    /// let start = 50u32;
+    /// let x = 10u32;
+    /// let end = 20u32;
+    ///   
+    /// assert!(x.is_between_wrapped(start, end.wrapping_add(1)));
+    /// ```
     fn is_between_wrapped(&self, start: u32, end: u32) -> bool {
         use std::cmp::Ordering;
 
@@ -202,34 +251,5 @@ impl Wrap for u32 {
             //  0 |------X-----E---------S------------| OK
             Ordering::Greater => end < start && end > *self,
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn deals_with_wrapping_less() {
-        // Tests this case (X > S)
-        //  0 |------E-----S---------X-------------| OK
-        //           10    30        50
-        let start = 30u32;
-        let x = 50u32;
-        let end = 10u32;
-
-        assert!(x.is_between_wrapped(start, end.wrapping_add(1)));
-    }
-
-    #[test]
-    fn deals_with_wrapping_greater() {
-        // Tests this case (X < S)
-        //  0 |------X-----E---------S------------| OK
-        //           10    20        50
-        let start = 50u32;
-        let x = 10u32;
-        let end = 20u32;
-
-        assert!(x.is_between_wrapped(start, end.wrapping_add(1)));
     }
 }
