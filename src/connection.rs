@@ -1,8 +1,7 @@
 #![allow(unused_variables)]
 #![allow(dead_code)]
-use std::{error::Error, io, net::Ipv4Addr, u32};
-
 use etherparse::{Ipv4HeaderSlice, TcpHeaderSlice};
+use std::{cmp::Ordering, error::Error, net::Ipv4Addr, u32};
 
 /// TCP connection states
 pub enum State {
@@ -10,6 +9,10 @@ pub enum State {
     SynRecvd,
     /// Connection established
     Estab,
+    FinWait1,
+    FinWait2,
+    Closing,
+    TimeWait,
 }
 
 // TCB - transmition control block
@@ -18,6 +21,8 @@ pub struct Connection {
     pub state: State,
     /// Connection IP Header
     pub ip: etherparse::Ipv4Header,
+    /// Connection TCP Header
+    pub tcp: etherparse::TcpHeader,
     pub send: SendSequenceSpace,
     pub recv: ReceiveSequenceSpace,
 }
@@ -82,6 +87,15 @@ pub struct Quad {
     pub dst: (Ipv4Addr, u16),
 }
 
+impl State {
+    fn is_synchronized(&self) -> bool {
+        match *self {
+            State::SynRecvd => false,
+            _ => true,
+        }
+    }
+}
+
 impl Connection {
     /// Accepts a new incoming connection, setting the initial handshake,
     /// receiving the SYN and returning an ACK and a SYN.
@@ -93,7 +107,7 @@ impl Connection {
         tcph: TcpHeaderSlice<'a>,
         _data: &'a [u8],
     ) -> Result<Option<Self>, Box<dyn Error>> {
-        let mut buf = [0u8; 1504];
+        let buf = [0u8; 1504];
 
         // Expect a packet that has the SYN bit set
         if !tcph.syn() {
@@ -101,6 +115,7 @@ impl Connection {
         }
 
         let iss = 0;
+        let wnd_size = 10;
         let mut c = Self {
             state: State::SynRecvd,
             recv: ReceiveSequenceSpace {
@@ -115,7 +130,7 @@ impl Connection {
                 iss,
                 una: iss,
                 nxt: iss + 1,
-                wnd: 10,
+                wnd: wnd_size,
                 up: false,
                 wl1: 0,
                 wl2: 0,
@@ -127,32 +142,20 @@ impl Connection {
                 iph.destination_addr().octets(),
                 iph.source_addr().octets(),
             ),
+
+            // Construct a new TCP header to send the acknowledgment
+            tcp: etherparse::TcpHeader::new(
+                tcph.destination_port(),
+                tcph.source_port(),
+                iss,
+                wnd_size,
+            ),
         };
 
-        // Construct a new TCP header to send the acknowledgment
-        // The kernel sets the checksum for us
-        let mut syn_ack = etherparse::TcpHeader::new(
-            tcph.destination_port(),
-            tcph.source_port(),
-            c.send.iss,
-            c.send.wnd,
-        );
+        c.tcp.syn = true;
+        c.tcp.ack = true;
 
-        syn_ack.acknowledgment_number = c.recv.nxt;
-        syn_ack.syn = true;
-        syn_ack.ack = true;
-        c.ip.set_payload_len(syn_ack.header_len() as usize + 0)?;
-
-        // Write headers to buffer
-        let unwritten = {
-            let mut unwritten = &mut buf[..];
-            c.ip.write(&mut unwritten)?;
-            syn_ack.write(&mut unwritten)?;
-            unwritten.len()
-        };
-
-        // Send the data back through the the network interface
-        nic.send(&buf[..buf.len() - unwritten])?;
+        c.write(nic, &[])?;
 
         Ok(Some(c))
     }
@@ -165,36 +168,14 @@ impl Connection {
         iph: Ipv4HeaderSlice<'a>,
         tcph: TcpHeaderSlice<'a>,
         data: &'a [u8],
-    ) -> io::Result<()> {
-        self.validate_acceptance(&tcph, &data)?;
-
-        println!("{:?} {:?}", tcph, data);
-
-        match self.state {
-            State::SynRecvd => {
-                // Expect to get an ACK for our SYN
-            }
-            State::Estab => {
-                todo!()
-            }
-        }
-        Ok(())
-    }
-
-    fn validate_acceptance<'a>(&self, tcph: &TcpHeaderSlice<'a>, data: &'a [u8]) -> io::Result<()> {
-        // Acceptable ACK check
-        // SND.UNA < SEG.ACK <= SND.NEXT
-        let ackn = tcph.acknowledgment_number();
-        if !ackn.is_between_wrapped(self.send.una, self.send.nxt.wrapping_add(1)) {
-            return Ok(());
-        }
-
+    ) -> Result<(), Box<dyn Error>> {
+        // Is this packet even worth looking into?
         // Valid segment check
         // RCV.NXT =< SEG.SEQ < RCV.NXT + RCV.WND // First bit
         // RCV.NXT =< SEG.SEQ + SEG.LEN - 1 < RCV.NXT + RCV.WND // Last bit
         let seqn = tcph.sequence_number();
-        let mut slen = data.len() as u32;
         let w_end = self.recv.nxt.wrapping_add(self.recv.wnd as u32);
+        let mut slen = data.len() as u32;
         if tcph.syn() {
             slen += 1;
         };
@@ -202,26 +183,131 @@ impl Connection {
             slen += 1;
         };
 
-        if slen.eq(&0) && !tcph.syn() && !tcph.fin() {
+        let okay = if slen.eq(&0) {
             // Zero-length segment and zero-length window
             if self.recv.wnd.eq(&0) {
                 // In this case, the seq number must be equal to nxt
-                if seqn.ne(&self.recv.nxt) {
-                    return Ok(());
-                }
-            } else if !seqn.is_between_wrapped(self.recv.nxt.wrapping_sub(1), w_end) {
-                return Ok(());
+                seqn.eq(&self.recv.nxt)
+            } else {
+                seqn.is_between_wrapped(self.recv.nxt.wrapping_sub(1), w_end)
             }
         } else {
             // If window is 0 than its not acceptable
-            if self.recv.wnd.eq(&0) {
-                return Ok(());
-            } else if !seqn.is_between_wrapped(self.recv.nxt.wrapping_sub(1), w_end)
-                && !(seqn + slen - 1).is_between_wrapped(self.recv.nxt.wrapping_sub(1), w_end)
+            !self.recv.wnd.eq(&0) ||
+            // if !(!false and !false) return false
+            !(!seqn.is_between_wrapped(self.recv.nxt.wrapping_sub(1), w_end)
+                && !seqn
+                    .wrapping_add(slen - 1)
+                    .is_between_wrapped(self.recv.nxt.wrapping_sub(1), w_end))
+        };
+
+        if !okay {
+            self.write(nic, &[])?;
+            return Ok(());
+        }
+
+        self.recv.nxt = seqn.wrapping_add(slen);
+
+        // Acceptable ACK check
+        // SND.UNA < SEG.ACK <= SND.NEXT
+        let ackn = tcph.acknowledgment_number();
+        if let State::SynRecvd = self.state {
+            println!("SYN Received");
+            if ackn.is_between_wrapped(self.send.una.wrapping_sub(1), self.send.nxt.wrapping_add(1))
             {
+                self.state = State::Estab;
+            } else {
+                // @TODO: RESET <SEQ=SEG.ACK> <CTL=RST>
+            }
+        };
+
+        if let State::Estab = self.state {
+            println!("Connection established");
+            if !ackn.is_between_wrapped(self.send.una, self.send.nxt.wrapping_add(1)) {
                 return Ok(());
             }
+
+            self.send.una = ackn;
+            assert!(data.is_empty());
+
+            // Terminate the connection
+            self.tcp.fin = true;
+            self.write(nic, &[])?;
+            self.state = State::FinWait1;
+        };
+
+        if let State::FinWait1 = self.state {
+            if self.send.una == self.send.iss + 2 {
+                // Our FIN has been ACKed
+                println!("Our FIN has been ACKed.");
+                self.state = State::FinWait2;
+            }
+        };
+
+        if tcph.fin() {
+            if let State::FinWait2 = self.state {
+                // We're done with the connection
+                println!("Client has FINed.");
+                self.write(nic, &[])?;
+                self.state = State::TimeWait;
+                return Ok(());
+            }
+        };
+
+        Ok(())
+    }
+
+    /// Sends a chunk of data through the tun_tap interface.
+    pub fn write(
+        &mut self,
+        nic: &mut tun_tap::Iface,
+        payload: &[u8],
+    ) -> Result<usize, Box<dyn Error>> {
+        let mut buf = [0u8; 1504];
+        self.tcp.sequence_number = self.send.nxt;
+        self.tcp.acknowledgment_number = self.recv.nxt;
+
+        let size = std::cmp::min(
+            buf.len(),
+            self.ip.header_len() + self.tcp.header_len() as usize + payload.len(),
+        );
+
+        self.ip.set_payload_len(size - self.ip.header_len())?;
+
+        self.tcp.checksum = self.tcp.calc_checksum_ipv4(&self.ip, &[])?;
+
+        // Write headers to buffer
+        use std::io::Write;
+
+        let mut unwritten = &mut buf[..];
+        self.ip.write(&mut unwritten)?;
+        self.tcp.write(&mut unwritten)?;
+        let payload_bytes = unwritten.write(payload)?;
+        let unwritten = unwritten.len();
+        self.send.nxt = self.send.nxt.wrapping_add(payload_bytes as u32);
+
+        if self.tcp.syn {
+            self.send.nxt = self.send.nxt.wrapping_add(1u32);
+            self.tcp.syn = false;
         }
+
+        if self.tcp.fin {
+            self.send.nxt = self.send.nxt.wrapping_add(1u32);
+            self.tcp.fin = false;
+        }
+
+        // Send the data back through the the network interface
+        nic.send(&buf[..buf.len() - unwritten])?;
+
+        Ok(payload_bytes)
+    }
+
+    /// Helper function that sends a reset packet back to the client
+    fn send_rst(&mut self, nic: &mut tun_tap::Iface) -> Result<(), Box<dyn Error>> {
+        self.tcp.rst = true;
+        self.tcp.acknowledgment_number = 0;
+        self.tcp.sequence_number = 0;
+        self.write(nic, &[])?;
 
         Ok(())
     }
@@ -260,11 +346,8 @@ impl Wrap for u32 {
     /// assert!(x.is_between_wrapped(start, end.wrapping_add(1)));
     /// ```
     fn is_between_wrapped(&self, start: u32, end: u32) -> bool {
-        use std::cmp::Ordering;
-
         match start.cmp(&self) {
             Ordering::Equal => false,
-
             // Check is violated iff end is between start and x
             //  0 |------------S---------X--------E----| OK
             //  0 |------E-----S---------X-------------| OK
