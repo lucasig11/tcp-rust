@@ -1,7 +1,7 @@
 #![allow(unused_variables)]
 #![allow(dead_code)]
 use etherparse::{Ipv4HeaderSlice, TcpHeaderSlice};
-use std::{cmp::Ordering, error::Error, net::Ipv4Addr, u32};
+use std::{error::Error, net::Ipv4Addr, u32};
 
 /// TCP connection states
 pub enum State {
@@ -315,10 +315,14 @@ impl Connection {
 
 /// Trait to deal with comparison of wrapping numbers.
 pub trait Wrap {
+    fn is_wrapping(&self, rhs: u32) -> bool;
     fn is_between_wrapped(&self, start: u32, end: u32) -> bool;
 }
 
 impl Wrap for u32 {
+    fn is_wrapping(&self, rhs: u32) -> bool {
+        self.wrapping_sub(rhs) > 2 ^ 31
+    }
     /// Compare numbers taking into consideration that they can be
     /// wrapped.
     /// # Examples
@@ -346,19 +350,6 @@ impl Wrap for u32 {
     /// assert!(x.is_between_wrapped(start, end.wrapping_add(1)));
     /// ```
     fn is_between_wrapped(&self, start: u32, end: u32) -> bool {
-        match start.cmp(&self) {
-            Ordering::Equal => false,
-            // Check is violated iff end is between start and x
-            //  0 |------------S---------X--------E----| OK
-            //  0 |------E-----S---------X-------------| OK
-            //
-            //  0 |----S------------E----X-------------| Not OK
-            Ordering::Less => !(end >= start && end <= *self),
-
-            // Check is ok iff end is between start and x (S < E < X)
-            // Only this case (S > X)
-            //  0 |------X-----E---------S------------| OK
-            Ordering::Greater => end < start && end > *self,
-        }
+        start.is_wrapping(*self) && self.is_wrapping(end)
     }
 }
