@@ -1,6 +1,6 @@
 #![allow(unused_variables)]
 #![allow(dead_code)]
-use std::{convert::TryInto, error::Error, io, net::Ipv4Addr, u32};
+use std::{error::Error, io, net::Ipv4Addr, u32};
 
 use etherparse::{Ipv4HeaderSlice, TcpHeaderSlice};
 
@@ -166,6 +166,22 @@ impl Connection {
         tcph: TcpHeaderSlice<'a>,
         data: &'a [u8],
     ) -> io::Result<()> {
+        self.validate_acceptance(&tcph, &data)?;
+
+        println!("{:?} {:?}", tcph, data);
+
+        match self.state {
+            State::SynRecvd => {
+                // Expect to get an ACK for our SYN
+            }
+            State::Estab => {
+                todo!()
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_acceptance<'a>(&self, tcph: &TcpHeaderSlice<'a>, data: &'a [u8]) -> io::Result<()> {
         // Acceptable ACK check
         // SND.UNA < SEG.ACK <= SND.NEXT
         let ackn = tcph.acknowledgment_number();
@@ -177,26 +193,36 @@ impl Connection {
         // RCV.NXT =< SEG.SEQ < RCV.NXT + RCV.WND // First bit
         // RCV.NXT =< SEG.SEQ + SEG.LEN - 1 < RCV.NXT + RCV.WND // Last bit
         let seqn = tcph.sequence_number();
-        let len: u32 = data.len().try_into().unwrap();
+        let mut slen = data.len() as u32;
+        let w_end = self.recv.nxt.wrapping_add(self.recv.wnd as u32);
+        if tcph.syn() {
+            slen += 1;
+        };
+        if tcph.fin() {
+            slen += 1;
+        };
 
-        if !seqn.is_between_wrapped(
-            self.recv.nxt.wrapping_sub(1),
-            self.recv.nxt.wrapping_add(self.recv.wnd as u32),
-        ) && !(seqn + len - 1).is_between_wrapped(
-            self.recv.nxt.wrapping_sub(1),
-            self.recv.nxt.wrapping_add(self.recv.wnd as u32),
-        ) {
-            return Ok(());
+        if slen.eq(&0) && !tcph.syn() && !tcph.fin() {
+            // Zero-length segment and zero-length window
+            if self.recv.wnd.eq(&0) {
+                // In this case, the seq number must be equal to nxt
+                if seqn.ne(&self.recv.nxt) {
+                    return Ok(());
+                }
+            } else if !seqn.is_between_wrapped(self.recv.nxt.wrapping_sub(1), w_end) {
+                return Ok(());
+            }
+        } else {
+            // If window is 0 than its not acceptable
+            if self.recv.wnd.eq(&0) {
+                return Ok(());
+            } else if !seqn.is_between_wrapped(self.recv.nxt.wrapping_sub(1), w_end)
+                && !(seqn + slen - 1).is_between_wrapped(self.recv.nxt.wrapping_sub(1), w_end)
+            {
+                return Ok(());
+            }
         }
 
-        match self.state {
-            State::SynRecvd => {
-                // Expect to get an ACK for our SYN
-            }
-            State::Estab => {
-                todo!()
-            }
-        }
         Ok(())
     }
 }
