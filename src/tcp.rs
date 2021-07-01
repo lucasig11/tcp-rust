@@ -234,25 +234,26 @@ impl Connection {
             }
         };
 
-        if let State::Estab = self.state {
-            println!("Connection established");
-            if !ackn.is_between_wrapped(self.send.una, self.send.nxt.wrapping_add(1)) {
-                return Ok(self.availability());
+        if let State::Estab | State::FinWait1 | State::FinWait2 = self.state {
+            if ackn.is_between_wrapped(self.send.una, self.send.nxt.wrapping_add(1)) {
+                self.send.una = ackn;
             }
 
-            self.send.una = ackn;
+            // TODO: Accept data
             assert!(data.is_empty());
 
-            // Terminate the connection
-            self.tcp.fin = true;
-            self.write(nic, &[])?;
-            self.state = State::FinWait1;
+            if let State::Estab = self.state {
+                // Terminate the connection
+                println!("Sending FIN, expecting an ACK!");
+                self.tcp.fin = true;
+                self.write(nic, &[])?;
+                self.state = State::FinWait1;
+            }
         };
 
         if let State::FinWait1 = self.state {
             if self.send.una == self.send.iss + 2 {
-                // Our FIN has been ACKed
-                println!("Our FIN has been ACKed. FIN: {}", tcph.fin());
+                println!("Our FIN has been ACKed!");
                 self.state = State::FinWait2;
             }
         };
