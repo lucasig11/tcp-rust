@@ -365,6 +365,7 @@ dependencies = [
 name = "tcp_rust"
 version = "0.1.0"
 dependencies = [
+ "bitflags",
  "etherparse",
  "tun-tap",
 ]

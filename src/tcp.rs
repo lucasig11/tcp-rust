@@ -1,5 +1,13 @@
+use bitflags::bitflags;
 use etherparse::{Ipv4HeaderSlice, TcpHeaderSlice};
 use std::{collections::VecDeque, error::Error, io, u32};
+
+bitflags! {
+    pub(crate) struct Available: u8 {
+        const READ = 0b000000001;
+        const WRITE = 0b00000010;
+    }
+}
 
 /// TCP connection states
 #[derive(Clone)]
@@ -92,6 +100,15 @@ impl State {
 }
 
 impl Connection {
+    fn availability(&self) -> Available {
+        let mut a = Available::empty();
+        if self.is_recv_closed() || !self.incoming.is_empty() {
+            a |= Available::READ;
+        };
+        // TODO: set available::WRITE
+        a
+    }
+
     /// Accepts a new incoming connection, setting the initial handshake,
     /// receiving the SYN and returning an ACK and a SYN.
     /// The 'a here is the lifetime of the packet itself,
@@ -158,13 +175,13 @@ impl Connection {
 
     /// Gets called when the connection is already known.
     /// Expecting an ACK for the SYN we sent on [`Connection::accept()`].
-    pub fn on_packet<'a>(
+    pub(crate) fn on_packet<'a>(
         &mut self,
         nic: &mut tun_tap::Iface,
         _iph: Ipv4HeaderSlice<'a>,
         tcph: TcpHeaderSlice<'a>,
         data: &'a [u8],
-    ) -> Result<(), Box<dyn Error>> {
+    ) -> io::Result<Available> {
         // Is this packet even worth looking into?
         // Valid segment check
         // RCV.NXT =< SEG.SEQ < RCV.NXT + RCV.WND // First bit
@@ -199,7 +216,7 @@ impl Connection {
 
         if !okay {
             self.write(nic, &[])?;
-            return Ok(());
+            return Ok(self.availability());
         }
 
         self.recv.nxt = seqn.wrapping_add(slen);
@@ -220,7 +237,7 @@ impl Connection {
         if let State::Estab = self.state {
             println!("Connection established");
             if !ackn.is_between_wrapped(self.send.una, self.send.nxt.wrapping_add(1)) {
-                return Ok(());
+                return Ok(self.availability());
             }
 
             self.send.una = ackn;
@@ -246,11 +263,11 @@ impl Connection {
                 println!("Client has FINed.");
                 self.write(nic, &[])?;
                 self.state = State::TimeWait;
-                return Ok(());
+                return Ok(self.availability());
             }
         };
 
-        Ok(())
+        Ok(self.availability())
     }
 
     /// Sends a chunk of data through the tun_tap interface.
@@ -320,6 +337,14 @@ impl Connection {
         self.write(nic, &[])?;
 
         Ok(())
+    }
+
+    pub(crate) fn is_recv_closed(&self) -> bool {
+        if let State::TimeWait = self.state {
+            // PTPD: CloseWait, LastAck, Closed, Closing
+            return true;
+        }
+        false
     }
 }
 

@@ -29,6 +29,7 @@ struct Quad {
 struct Handler {
     manager: Mutex<ConnectionManager>,
     pending_var: Condvar,
+    recv_var: Condvar,
 }
 
 type InterfaceHandle = Arc<Handler>;
@@ -81,14 +82,20 @@ fn packet_loop(mut nic: tun_tap::Iface, ih: InterfaceHandle) -> io::Result<()> {
                 match cm.connections.entry(quad) {
                     Entry::Occupied(mut c) => {
                         eprintln!("Got packet for known quad {:?}", quad);
-                        c.get_mut()
-                            .on_packet(&mut nic, iph, tcph, &buf[data..nbytes])
-                            .or_else(|_e| {
-                                Err(io::Error::new(
-                                    io::ErrorKind::ConnectionAborted,
-                                    "Error receiving packet",
-                                ))
-                            })?;
+                        let available =
+                            c.get_mut()
+                                .on_packet(&mut nic, iph, tcph, &buf[data..nbytes])?;
+
+                        // TODO: compare before/after
+                        drop(cmg);
+
+                        if available.contains(tcp::Available::READ) {
+                            ih.recv_var.notify_all();
+                        }
+
+                        if available.contains(tcp::Available::WRITE) {
+                            // TODO: ih.send_var.notify_all();
+                        }
                     }
                     Entry::Vacant(e) => {
                         eprintln!("Got packet for unknown quad {:?}", quad);
@@ -222,41 +229,42 @@ impl Read for TcpStream {
         // Try to take the lock
         let mut cm = self.ih.manager.lock().unwrap();
 
-        // Lookup the connection for the TCP Stream we're trying to read from
-        let c = cm.connections.get_mut(&self.quad).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::ConnectionAborted,
-                "Stream was terminated unexpectedly",
-            )
-        })?;
+        loop {
+            // Lookup the connection for the TCP Stream we're trying to read from
+            let c = cm.connections.get_mut(&self.quad).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "Stream was terminated unexpectedly",
+                )
+            })?;
 
-        // If there's no data, block
-        if c.incoming.is_empty() {
-            // TODO: block
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "No bytes to read",
-            ));
+            if c.is_recv_closed() && c.incoming.is_empty() {
+                // No more data to read and no need to block
+                // because there won't be anymore
+                return Ok(0);
+            }
+
+            if !c.incoming.is_empty() {
+                // Here we have data
+                // Try to read as much as we can
+                let mut nread = 0;
+                let (head, tail) = c.incoming.as_slices();
+                // Don't overflow buf
+                let hread = cmp::min(buf.len(), head.len());
+                buf.copy_from_slice(&head[..hread]);
+
+                nread += hread;
+                let tread = cmp::min(buf.len() - nread, tail.len());
+                buf.copy_from_slice(&tail[..]);
+                nread += tread;
+                drop(c.incoming.drain(..nread));
+
+                // Return amount of bytes read
+                return Ok(nread);
+            }
+
+            cm = self.ih.recv_var.wait(cm).unwrap();
         }
-
-        // TODO: detect FIN and return nread == 0
-
-        // Here we have data
-        // Try to read as much as we can
-        let mut nread = 0;
-        let (head, tail) = c.incoming.as_slices();
-        // Don't overflow buf
-        let hread = cmp::min(buf.len(), head.len());
-        buf.copy_from_slice(&head[..hread]);
-
-        nread += hread;
-        let tread = cmp::min(buf.len() - nread, tail.len());
-        buf.copy_from_slice(&tail[..]);
-        nread += tread;
-        drop(c.incoming.drain(..nread));
-
-        // Return amount of bytes read
-        Ok(nread)
     }
 }
 

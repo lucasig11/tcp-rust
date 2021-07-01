@@ -1,25 +1,31 @@
-use std::{io, thread};
+use std::{
+    io::{self, Read},
+    thread,
+};
 
 use tcp_rust::Interface;
 fn main() -> io::Result<()> {
-    let mut i = Interface::new()?;
-    let mut l1 = i.bind(9000)?;
-    let mut l2 = i.bind(9001)?;
+    let port = std::env::args()
+        .collect::<Vec<String>>()
+        .get(1)
+        .or(Some(&String::from("9000")))
+        .unwrap()
+        .parse::<u16>()
+        .unwrap();
 
-    let jh1 = thread::spawn(move || {
-        while let Ok(_stream) = l1.accept() {
-            eprintln!("Got connection on 9000");
-        }
-    });
+    let mut interface = Interface::new()?;
+    let mut listener = interface.bind(port)?;
 
-    let jh2 = thread::spawn(move || {
-        while let Ok(_stream) = l2.accept() {
-            eprintln!("Got connection on 9001");
-        }
-    });
+    eprintln!("Bound listener on port {}", port);
 
-    jh1.join().unwrap();
-    jh2.join().unwrap();
+    while let Ok(mut stream) = listener.accept() {
+        eprintln!("Got connection!");
+        thread::spawn(move || {
+            let n = stream.read(&mut [0]).unwrap();
+            eprintln!("Read {} bytes of data", n);
+            assert_eq!(n, 0);
+        });
+    }
 
     Ok(())
 }
