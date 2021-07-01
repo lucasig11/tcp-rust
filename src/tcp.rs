@@ -1,9 +1,8 @@
-#![allow(unused_variables)]
-#![allow(dead_code)]
 use etherparse::{Ipv4HeaderSlice, TcpHeaderSlice};
-use std::{error::Error, net::Ipv4Addr, u32};
+use std::{collections::VecDeque, error::Error, io, u32};
 
 /// TCP connection states
+#[derive(Clone)]
 pub enum State {
     /// SYN Received
     SynRecvd,
@@ -16,15 +15,18 @@ pub enum State {
 }
 
 // TCB - transmition control block
+#[derive(Clone)]
 pub struct Connection {
     /// Connection's current state. See [`State`].
-    pub state: State,
+    state: State,
     /// Connection IP Header
-    pub ip: etherparse::Ipv4Header,
+    ip: etherparse::Ipv4Header,
     /// Connection TCP Header
-    pub tcp: etherparse::TcpHeader,
-    pub send: SendSequenceSpace,
-    pub recv: ReceiveSequenceSpace,
+    tcp: etherparse::TcpHeader,
+    send: SendSequenceSpace,
+    recv: ReceiveSequenceSpace,
+    pub(crate) incoming: VecDeque<u8>,
+    pub(crate) unacked: VecDeque<u8>,
 }
 
 /// Send Sequence Space (RFC 793 S3.2 F4)
@@ -39,21 +41,22 @@ pub struct Connection {
 /// 3 - sequence numbers allowed for new data transmission
 /// 4 - future sequence numbers which are not yet allowed
 /// ```
+#[derive(Clone)]
 pub struct SendSequenceSpace {
     /// Send Unacknowledged
-    pub una: u32,
+    una: u32,
     /// Send Next
-    pub nxt: u32,
+    nxt: u32,
     /// Send window
-    pub wnd: u16,
+    wnd: u16,
     /// Send urgent pointer
-    pub up: bool,
+    up: bool,
     /// Segment sequence number for last window update
-    pub wl1: u32,
+    wl1: u32,
     /// Segment acknowledgement numebr use for alast window update
-    pub wl2: u32,
+    wl2: u32,
     /// Initial sequence number
-    pub iss: u32,
+    iss: u32,
 }
 
 /// Receive Sequence Space (RFC 793 S3.2 F5)
@@ -67,28 +70,20 @@ pub struct SendSequenceSpace {
 /// 2 - sequence numbers allowed for new reception
 /// 3 - future sequence numbers which are not yet allowed
 /// ```
+#[derive(Clone)]
 pub struct ReceiveSequenceSpace {
     /// Receive Next
-    pub nxt: u32,
+    nxt: u32,
     /// Receive window
-    pub wnd: u16,
+    wnd: u16,
     /// Receive urgent pointer
-    pub up: bool,
+    up: bool,
     /// Initial receive sequence number
-    pub irs: u32,
-}
-
-/// Connection quad
-#[derive(Debug, Hash, Eq, PartialEq)]
-pub struct Quad {
-    /// Source IP and Port
-    pub src: (Ipv4Addr, u16),
-    /// Destination IP and Port
-    pub dst: (Ipv4Addr, u16),
+    irs: u32,
 }
 
 impl State {
-    fn is_synchronized(&self) -> bool {
+    pub fn is_synchronized(&self) -> bool {
         match *self {
             State::SynRecvd => false,
             _ => true,
@@ -106,9 +101,7 @@ impl Connection {
         iph: Ipv4HeaderSlice<'a>,
         tcph: TcpHeaderSlice<'a>,
         _data: &'a [u8],
-    ) -> Result<Option<Self>, Box<dyn Error>> {
-        let buf = [0u8; 1504];
-
+    ) -> io::Result<Option<Self>> {
         // Expect a packet that has the SYN bit set
         if !tcph.syn() {
             return Ok(None);
@@ -150,6 +143,9 @@ impl Connection {
                 iss,
                 wnd_size,
             ),
+
+            incoming: Default::default(),
+            unacked: Default::default(),
         };
 
         c.tcp.syn = true;
@@ -165,7 +161,7 @@ impl Connection {
     pub fn on_packet<'a>(
         &mut self,
         nic: &mut tun_tap::Iface,
-        iph: Ipv4HeaderSlice<'a>,
+        _iph: Ipv4HeaderSlice<'a>,
         tcph: TcpHeaderSlice<'a>,
         data: &'a [u8],
     ) -> Result<(), Box<dyn Error>> {
@@ -239,7 +235,7 @@ impl Connection {
         if let State::FinWait1 = self.state {
             if self.send.una == self.send.iss + 2 {
                 // Our FIN has been ACKed
-                println!("Our FIN has been ACKed.");
+                println!("Our FIN has been ACKed. FIN: {}", tcph.fin());
                 self.state = State::FinWait2;
             }
         };
@@ -258,11 +254,7 @@ impl Connection {
     }
 
     /// Sends a chunk of data through the tun_tap interface.
-    pub fn write(
-        &mut self,
-        nic: &mut tun_tap::Iface,
-        payload: &[u8],
-    ) -> Result<usize, Box<dyn Error>> {
+    pub fn write(&mut self, nic: &mut tun_tap::Iface, payload: &[u8]) -> io::Result<usize> {
         let mut buf = [0u8; 1504];
         self.tcp.sequence_number = self.send.nxt;
         self.tcp.acknowledgment_number = self.recv.nxt;
@@ -272,15 +264,33 @@ impl Connection {
             self.ip.header_len() + self.tcp.header_len() as usize + payload.len(),
         );
 
-        self.ip.set_payload_len(size - self.ip.header_len())?;
+        self.ip
+            .set_payload_len(size - self.ip.header_len())
+            .or_else(|_e| {
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Error calculating checksum",
+                ))
+            })?;
 
-        self.tcp.checksum = self.tcp.calc_checksum_ipv4(&self.ip, &[])?;
+        self.tcp.checksum = self.tcp.calc_checksum_ipv4(&self.ip, &[]).or_else(|_e| {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Error calculating IPV4 checksum",
+            ))
+        })?;
 
         // Write headers to buffer
         use std::io::Write;
 
         let mut unwritten = &mut buf[..];
-        self.ip.write(&mut unwritten)?;
+        self.ip.write(&mut unwritten).or_else(|_e| {
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "Error writing headers to buffer",
+            ))
+        })?;
+
         self.tcp.write(&mut unwritten)?;
         let payload_bytes = unwritten.write(payload)?;
         let unwritten = unwritten.len();
@@ -303,7 +313,7 @@ impl Connection {
     }
 
     /// Helper function that sends a reset packet back to the client
-    fn send_rst(&mut self, nic: &mut tun_tap::Iface) -> Result<(), Box<dyn Error>> {
+    pub fn send_rst(&mut self, nic: &mut tun_tap::Iface) -> Result<(), Box<dyn Error>> {
         self.tcp.rst = true;
         self.tcp.acknowledgment_number = 0;
         self.tcp.sequence_number = 0;
@@ -321,7 +331,7 @@ pub trait Wrap {
 
 impl Wrap for u32 {
     fn is_wrapping(&self, rhs: u32) -> bool {
-        self.wrapping_sub(rhs) > 2 ^ 31
+        self.wrapping_sub(rhs) > (1 << 31)
     }
     /// Compare numbers taking into consideration that they can be
     /// wrapped.

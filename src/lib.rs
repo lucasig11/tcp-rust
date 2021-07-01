@@ -1,58 +1,321 @@
-pub mod connection;
-
-use connection::{Connection, Quad};
-use etherparse::{Ipv4HeaderSlice, TcpHeaderSlice};
 use std::{
-    collections::{hash_map::Entry, HashMap},
-    error::Error,
+    cmp,
+    collections::{hash_map::Entry, HashMap, VecDeque},
+    io::{self, Read, Write},
+    net::Ipv4Addr,
+    sync::{Arc, Condvar, Mutex},
+    thread,
 };
 
+use etherparse::{Ipv4HeaderSlice, TcpHeaderSlice};
+
+use tcp::Connection;
+
+pub mod tcp;
+
+const SENDQUEUE_SIZE: usize = 1024;
 const TCP_PROTO_NO: u8 = 0x06;
-pub struct TcpSocket;
 
-impl TcpSocket {
-    pub fn run() -> Result<(), Box<dyn Error>> {
-        let mut connections: HashMap<Quad, Connection> = Default::default();
+/// Connection quad
+#[derive(Debug, Hash, Eq, PartialEq, Clone, Copy)]
+struct Quad {
+    /// Source IP and Port
+    src: (Ipv4Addr, u16),
+    /// Destination IP and Port
+    dst: (Ipv4Addr, u16),
+}
 
-        // Kernel network interface
-        let mut nic = tun_tap::Iface::without_packet_info("tun0", tun_tap::Mode::Tun)?;
-        // Ethernet packet buffer
-        let mut buf = [0u8; 1504];
+#[derive(Default)]
+struct Handler {
+    manager: Mutex<ConnectionManager>,
+    pending_var: Condvar,
+}
 
-        loop {
-            let nbytes = nic.recv(&mut buf[..])?;
+type InterfaceHandle = Arc<Handler>;
 
-            // Parse IPV4 packet
-            if let Ok(iph) = Ipv4HeaderSlice::from_slice(&buf[..nbytes]) {
-                // Filter non-TCP packets
-                if iph.protocol() != TCP_PROTO_NO {
-                    continue;
-                }
+pub struct Interface {
+    /// Interface handle
+    ih: Option<InterfaceHandle>,
+    /// Join handle
+    jh: Option<thread::JoinHandle<io::Result<()>>>,
+}
 
-                let p_src = iph.source_addr();
-                let p_dest = iph.destination_addr();
+#[derive(Default)]
+struct ConnectionManager {
+    // TODO: terminate: bool,
+    /// Connections map
+    connections: HashMap<Quad, Connection>,
+    /// List of pending connections to a port
+    pending: HashMap<u16, VecDeque<Quad>>,
+}
 
-                if let Ok(tcph) = TcpHeaderSlice::from_slice(&buf[iph.slice().len()..]) {
-                    // Here we know we have a TCP packet
-                    let data = iph.slice().len() + tcph.slice().len();
-                    match connections.entry(Quad {
-                        src: (p_src, tcph.source_port()),
-                        dst: (p_dest, tcph.destination_port()),
-                    }) {
-                        Entry::Occupied(mut c) => {
-                            c.get_mut()
-                                .on_packet(&mut nic, iph, tcph, &buf[data..nbytes])?;
-                        }
-                        Entry::Vacant(e) => {
+fn packet_loop(mut nic: tun_tap::Iface, ih: InterfaceHandle) -> io::Result<()> {
+    let mut buf = [0u8; 1504];
+
+    loop {
+        let nbytes = nic.recv(&mut buf[..])?;
+
+        // Parse IPV4 packet
+        if let Ok(iph) = Ipv4HeaderSlice::from_slice(&buf[..nbytes]) {
+            // Filter non-TCP packets
+            if iph.protocol() != TCP_PROTO_NO {
+                continue;
+            }
+
+            let p_src = iph.source_addr();
+            let p_dest = iph.destination_addr();
+
+            if let Ok(tcph) = TcpHeaderSlice::from_slice(&buf[iph.slice().len()..]) {
+                // Here we know we have a TCP packet
+                // Try to lock the thread
+                let mut cmg = ih.manager.lock().unwrap();
+                // Dereference to get a mutable reference to the CM, instead of the Mutex
+                let cm = &mut *cmg;
+
+                let data = iph.slice().len() + tcph.slice().len();
+                let quad = Quad {
+                    src: (p_src, tcph.source_port()),
+                    dst: (p_dest, tcph.destination_port()),
+                };
+
+                match cm.connections.entry(quad) {
+                    Entry::Occupied(mut c) => {
+                        eprintln!("Got packet for known quad {:?}", quad);
+                        c.get_mut()
+                            .on_packet(&mut nic, iph, tcph, &buf[data..nbytes])
+                            .or_else(|_e| {
+                                Err(io::Error::new(
+                                    io::ErrorKind::ConnectionAborted,
+                                    "Error receiving packet",
+                                ))
+                            })?;
+                    }
+                    Entry::Vacant(e) => {
+                        eprintln!("Got packet for unknown quad {:?}", quad);
+                        // Do we have a listener for this port?
+                        if let Some(pending) = cm.pending.get_mut(&tcph.destination_port()) {
                             if let Some(c) =
                                 Connection::accept(&mut nic, iph, tcph, &buf[data..nbytes])?
                             {
                                 e.insert(c);
+                                pending.push_back(quad);
+                                drop(cmg);
+                                ih.pending_var.notify_all();
+                                // TODO: wake up pending connection
                             }
                         }
                     }
                 }
             }
         }
+    }
+}
+
+impl Drop for Interface {
+    fn drop(&mut self) {
+        // TODO: self.ih.as_mut().unwrap().lock().unwrap().terminate = true;
+
+        drop(&self.ih.take());
+        self.jh
+            .take()
+            .expect("Interface dropped more than once")
+            .join()
+            .unwrap()
+            .unwrap();
+    }
+}
+
+impl Interface {
+    pub fn new() -> io::Result<Self> {
+        let nic = tun_tap::Iface::without_packet_info("tun0", tun_tap::Mode::Tun)?;
+
+        let ih: InterfaceHandle = Arc::default();
+
+        let jh = {
+            let ih = ih.clone();
+            thread::spawn(move || packet_loop(nic, ih))
+        };
+
+        Ok(Interface {
+            ih: Some(ih),
+            jh: Some(jh),
+        })
+    }
+
+    pub fn bind(&mut self, port: u16) -> io::Result<TcpListener> {
+        // Take the lock
+        let mut cm = self.ih.as_mut().unwrap().manager.lock().unwrap();
+        match cm.pending.entry(port) {
+            Entry::Vacant(v) => {
+                v.insert(VecDeque::new());
+            }
+            Entry::Occupied(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    "port already bound",
+                ));
+            }
+        };
+        drop(cm);
+        Ok(TcpListener {
+            port,
+            ih: self.ih.as_mut().unwrap().clone(),
+        })
+    }
+}
+
+pub struct TcpListener {
+    port: u16,
+    ih: InterfaceHandle,
+}
+
+impl TcpListener {
+    pub fn accept(&mut self) -> io::Result<TcpStream> {
+        let mut cm = self.ih.manager.lock().unwrap();
+        loop {
+            if let Some(quad) = cm
+                .pending
+                .get_mut(&self.port)
+                .expect("Port closed while listener still active")
+                .pop_front()
+            {
+                return Ok(TcpStream {
+                    ih: self.ih.clone(),
+                    quad,
+                });
+            }
+            cm = self.ih.pending_var.wait(cm).unwrap();
+        }
+    }
+}
+
+impl Drop for TcpListener {
+    fn drop(&mut self) {
+        let mut cm = self.ih.manager.lock().unwrap();
+        let pending = cm
+            .pending
+            .remove(&self.port)
+            .expect("Port closed while listener still active");
+
+        // Terminate the connections that are being dropped here
+        for _quad in pending {
+            // TODO: terminate cm.connections[quad]
+            unimplemented!()
+        }
+    }
+}
+
+pub struct TcpStream {
+    quad: Quad,
+    ih: InterfaceHandle,
+}
+
+impl TcpStream {
+    pub fn shutdown(&self, _how: std::net::Shutdown) -> io::Result<()> {
+        // Sets a Fin Flag
+        unimplemented!()
+    }
+}
+
+impl Read for TcpStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        // Try to take the lock
+        let mut cm = self.ih.manager.lock().unwrap();
+
+        // Lookup the connection for the TCP Stream we're trying to read from
+        let c = cm.connections.get_mut(&self.quad).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "Stream was terminated unexpectedly",
+            )
+        })?;
+
+        // If there's no data, block
+        if c.incoming.is_empty() {
+            // TODO: block
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "No bytes to read",
+            ));
+        }
+
+        // TODO: detect FIN and return nread == 0
+
+        // Here we have data
+        // Try to read as much as we can
+        let mut nread = 0;
+        let (head, tail) = c.incoming.as_slices();
+        // Don't overflow buf
+        let hread = cmp::min(buf.len(), head.len());
+        buf.copy_from_slice(&head[..hread]);
+
+        nread += hread;
+        let tread = cmp::min(buf.len() - nread, tail.len());
+        buf.copy_from_slice(&tail[..]);
+        nread += tread;
+        drop(c.incoming.drain(..nread));
+
+        // Return amount of bytes read
+        Ok(nread)
+    }
+}
+
+impl Write for TcpStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        // Try to take the lock
+        let mut cm = self.ih.manager.lock().unwrap();
+
+        // Lookup the connection for the TCP Stream we're trying to read from
+        let c = cm.connections.get_mut(&self.quad).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "Stream was terminated unexpectedly",
+            )
+        })?;
+
+        if c.unacked.len() >= SENDQUEUE_SIZE {
+            // TODO: block
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "Too many bytes buffered",
+            ));
+        };
+
+        let nwrite = std::cmp::min(buf.len(), SENDQUEUE_SIZE - c.unacked.len());
+        c.unacked.extend(&buf[..nwrite]);
+
+        // TODO: Wake up writer
+        Ok(nwrite)
+    }
+
+    // Block until there are no bytes in the local buffer
+    fn flush(&mut self) -> io::Result<()> {
+        let mut cm = self.ih.manager.lock().unwrap();
+
+        // Lookup the connection for the TCP Stream we're trying to read from
+        let c = cm.connections.get_mut(&self.quad).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "Stream was terminated unexpectedly",
+            )
+        })?;
+
+        if c.unacked.is_empty() {
+            Ok(())
+        } else {
+            // TODO: block
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "Too many bytes buffered",
+            ));
+        }
+    }
+}
+
+impl Drop for TcpStream {
+    fn drop(&mut self) {
+        let mut _cm = self.ih.manager.lock().unwrap();
+        // TODO: send FIN cm.connections[quad]
+        // Terminate the connections that are being dropped here
     }
 }
