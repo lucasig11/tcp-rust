@@ -1,5 +1,5 @@
 #!/bin/bash
-cargo b --release
+cargo b --release 
 ext=$?
 if [ $ext -ne 0 ]; then
 	exit $ext

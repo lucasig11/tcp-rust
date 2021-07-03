@@ -125,7 +125,7 @@ impl Connection {
         }
 
         let iss = 0;
-        let wnd_size = 10;
+        let wnd_size = 1024;
         let mut c = Self {
             state: State::SynRecvd,
             recv: ReceiveSequenceSpace {
@@ -219,13 +219,12 @@ impl Connection {
             return Ok(self.availability());
         }
 
-        self.recv.nxt = seqn.wrapping_add(slen);
+        // self.recv.nxt = seqn.wrapping_add(slen);
 
         // Acceptable ACK check
         // SND.UNA < SEG.ACK <= SND.NEXT
         let ackn = tcph.acknowledgment_number();
         if let State::SynRecvd = self.state {
-            println!("SYN Received");
             if ackn.is_between_wrapped(self.send.una.wrapping_sub(1), self.send.nxt.wrapping_add(1))
             {
                 self.state = State::Estab;
@@ -239,29 +238,53 @@ impl Connection {
                 self.send.una = ackn;
             }
 
-            // TODO: Accept data
-            assert!(data.is_empty());
+            // TODO: prune self.unacked
+            // TODO: if unacked.is_empty() && waiting flush, notify
+            // update window
 
+            // Write not yet supported, so send FIN
             if let State::Estab = self.state {
-                // Terminate the connection
-                println!("Sending FIN, expecting an ACK!");
+                // TODO: needs to be stored in the restransmission queue
                 self.tcp.fin = true;
-                self.write(nic, &[])?;
                 self.state = State::FinWait1;
             }
         };
 
         if let State::FinWait1 = self.state {
             if self.send.una == self.send.iss + 2 {
-                println!("Our FIN has been ACKed!");
+                // Our FIN has been ACKed
                 self.state = State::FinWait2;
             }
+        };
+
+        if let State::Estab | State::FinWait1 | State::FinWait2 = self.state {
+            let mut unread_data_at = (self.recv.nxt - seqn) as usize;
+
+            if unread_data_at > data.len() {
+                assert_eq!(unread_data_at, data.len() + 1);
+                unread_data_at = 0;
+            }
+
+            self.incoming.extend(&data[unread_data_at..]);
+
+            /*
+                Once the TCP takes responsibility for the data, it advances
+                RCV.NXT over  the  data  accepted  and  adjust  RCV.WND  as
+                appropriate   to   the   current    buffer    availability.
+                The total of RCV.NXT and RCV.WND  should  not  be  reduced.
+            */
+            let len = data.len() as u32;
+
+            self.recv.nxt = seqn.wrapping_add(len.wrapping_add(tcph.fin().into()));
+
+            // Send an Ack of the form: <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
+            self.write(nic, &[])?;
         };
 
         if tcph.fin() {
             if let State::FinWait2 = self.state {
                 // We're done with the connection
-                println!("Client has FINed.");
+                // Client has FINed
                 self.write(nic, &[])?;
                 self.state = State::TimeWait;
                 return Ok(self.availability());

@@ -79,9 +79,9 @@ fn packet_loop(mut nic: tun_tap::Iface, ih: InterfaceHandle) -> io::Result<()> {
                     dst: (p_dest, tcph.destination_port()),
                 };
 
+                // Is the incoming connection known already?
                 match cm.connections.entry(quad) {
                     Entry::Occupied(mut c) => {
-                        eprintln!("Got packet for known quad {:?}", quad);
                         let available =
                             c.get_mut()
                                 .on_packet(&mut nic, iph, tcph, &buf[data..nbytes])?;
@@ -98,7 +98,6 @@ fn packet_loop(mut nic: tun_tap::Iface, ih: InterfaceHandle) -> io::Result<()> {
                         }
                     }
                     Entry::Vacant(e) => {
-                        eprintln!("Got packet for unknown quad {:?}", quad);
                         // Do we have a listener for this port?
                         if let Some(pending) = cm.pending.get_mut(&tcph.destination_port()) {
                             if let Some(c) =
@@ -155,11 +154,12 @@ impl Interface {
         match cm.pending.entry(port) {
             Entry::Vacant(v) => {
                 v.insert(VecDeque::new());
+                eprintln!("\x1b[1;32m[INFO]\x1b[;m Listening at port {}", port);
             }
             Entry::Occupied(_) => {
                 return Err(io::Error::new(
                     io::ErrorKind::AddrInUse,
-                    "port already bound",
+                    "Port already bound",
                 ));
             }
         };
@@ -220,6 +220,13 @@ pub struct TcpStream {
 impl TcpStream {
     pub fn shutdown(&self, _how: std::net::Shutdown) -> io::Result<()> {
         // Sets a Fin Flag
+        /*
+            Terminate the connection
+            println!("Sending FIN, expecting an ACK!");
+            self.tcp.fin = true;
+            self.write(nic, &[])?;
+            self.state = State::FinWait1;
+        */
         unimplemented!()
     }
 }
@@ -245,22 +252,27 @@ impl Read for TcpStream {
             }
 
             if !c.incoming.is_empty() {
-                // Here we have data
-                // Try to read as much as we can
-                let mut nread = 0;
-                let (head, tail) = c.incoming.as_slices();
-                // Don't overflow buf
-                let hread = cmp::min(buf.len(), head.len());
-                buf.copy_from_slice(&head[..hread]);
+                // Try to read as much data as we can
+                let mut n_read = 0;
 
-                nread += hread;
-                let tread = cmp::min(buf.len() - nread, tail.len());
-                buf.copy_from_slice(&tail[..]);
-                nread += tread;
-                drop(c.incoming.drain(..nread));
+                // c.incoming is a VecDeque, so read from head and from tail
+                let (head, tail) = c.incoming.as_slices();
+
+                // Read from head without overflowing the buf len
+                let h_read = cmp::min(buf.len(), head.len());
+                buf[..h_read].copy_from_slice(&head[..h_read]);
+                n_read += h_read;
+
+                // Read from tail without overflowing the buf len
+                let t_read = cmp::min(buf.len() - n_read, tail.len());
+                buf[..t_read].copy_from_slice(&tail[..]);
+                n_read += t_read;
+
+                // Drop the read bytes
+                drop(c.incoming.drain(..n_read));
 
                 // Return amount of bytes read
-                return Ok(nread);
+                return Ok(n_read);
             }
 
             cm = self.ih.recv_var.wait(cm).unwrap();
