@@ -34,7 +34,6 @@ fn main() -> io::Result<()> {
                 }
 
                 stream.write(&buf[..n]).unwrap();
-                stream.flush().unwrap();
 
                 eprintln!(
                     "\x1b[1;33m[READ]\x1b[;m {} bytes | UTF-8: {:?} | Raw: {:?}",
